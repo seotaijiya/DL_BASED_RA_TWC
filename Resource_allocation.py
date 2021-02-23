@@ -1,0 +1,1928 @@
+from __future__ import absolute_import, division, print_function
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras import layers
+from tensorflow import keras
+from itertools import product
+np.set_printoptions(precision=5, suppress=True)
+import time
+
+
+'''
+    Find the feasible location of users
+    This function finds the feasible location of INITIALIZATION
+    In this function, the location of RX is randomly chosen such that its distance with
+    TX is within Dist_TX_RX
+'''
+
+
+def Feasible_Loc_Init(Cur_loc, Size_area, Dist_TX_RX):
+    temp_dist = Dist_TX_RX * (np.random.rand(1, 2) - 0.5)
+    temp_chan = Cur_loc + temp_dist
+    while (np.max(abs(temp_chan)) > Size_area / 2) | (np.linalg.norm(temp_dist) > Dist_TX_RX):
+        temp_dist = Dist_TX_RX * (np.random.rand(1, 2) - 0.5)
+        temp_chan = Cur_loc + temp_dist
+    return temp_chan
+
+
+'''
+    Find the feasible location of users
+    This function finds the feasible location of LOCATION UPDATE
+    In this function, the location of RX is randomly chosen such that its distance with
+    TX is within Dist_TX_RX AND the updated location is Delta_mov away from current RX location
+
+'''
+
+
+def Feasible_Loc_Update(Cur_RX_loc, Cur_TX_loc, Size_area, Dist_TX_RX, Delta_mov):
+    temp_chan = 0
+    temp_dist = 2 * Dist_TX_RX
+
+    while (np.max(abs(temp_chan)) > Size_area / 2) | (np.linalg.norm(temp_dist) > Dist_TX_RX):
+        temp_dir = np.random.rand()
+        temp_dist_delta = [Delta_mov * np.cos(2 * np.pi * temp_dir), Delta_mov * np.sin(2 * np.pi * temp_dir)]
+        temp_chan = Cur_RX_loc + temp_dist_delta
+        temp_dist = Cur_TX_loc - temp_chan
+
+    return temp_chan
+
+
+'''
+    Initialization of location information.
+    It will return the location of one PU and SUs.
+    The Users will be allocated to 2D area whose range is -Size_area/2 ~ Size_area/2.
+    The distance between RX and TX for the same transmit pair is limited to "Dist_TX_RX"
+
+    Input: Size_area, Dist_TX_RX, Num_D2D, Num_Ch
+    -> Number of channel is same with the number of CUE
+
+'''
+
+
+def loc_init(Size_area, Dist_TX_RX, Num_D2D, Num_Ch):
+    tx_loc = Size_area * (np.random.rand(Num_D2D, 2) - 0.5)
+    rx_loc = np.zeros((Num_D2D + 1, 2))
+    for i in range(Num_D2D):
+        temp_chan = Feasible_Loc_Init(tx_loc[i, :], Size_area, Dist_TX_RX)
+        rx_loc[i, :] = temp_chan
+    tx_loc_CUE = Size_area * (np.random.rand(Num_Ch, 2) - 0.5)
+
+    return rx_loc, tx_loc, tx_loc_CUE
+
+
+'''
+    Update location of users.
+    Update is conducted by considering the Delta_mov which is the amount of distance that users moves
+
+    Input: Size_area, Dist_TX_RX, Num_D2D, Num_Ch
+    -> Number of channel is same with the number of CUE
+
+'''
+
+
+def loc_update(Size_area, Dist_TX_RX, rx_loc, tx_loc, tx_loc_CUE, Delta_mov):
+    tx_loc_update = tx_loc
+    rx_loc_update = rx_loc
+    tx_loc_CUE_update = tx_loc_CUE
+
+    Num_D2D = np.shape(tx_loc)[0]
+    Num_CH = np.shape(tx_loc_CUE)[0]
+
+    ## Determine the location of D2D users
+    for i in range(Num_D2D):
+        ## Use 2*size_area to deactivate the second condition
+        tx_loc_update[i, :] = Feasible_Loc_Update(tx_loc[i, :], tx_loc_update[i, :], Size_area, 2 * Size_area,
+                                                  Delta_mov)
+        rx_loc_update[i, :] = Feasible_Loc_Update(rx_loc[i, :], tx_loc_update[i, :], Size_area, Dist_TX_RX, Delta_mov)
+
+    ## Determine the location of CUE Users
+    for i in range(Num_CH):
+        tx_loc_CUE_update[i, :] = Feasible_Loc_Update(tx_loc_CUE[i, :], tx_loc_CUE[i, :], Size_area, 2 * Size_area,
+                                                      Delta_mov)
+
+    return rx_loc_update, tx_loc_update, tx_loc_CUE_update
+
+
+'''
+    Determine the channel gain  (UPLINK)
+
+    --------------------------------------------
+    ** The basic setting
+      : Pathloss exponent -> 3.8
+      : Pathloss constant -> 34.5
+      : Moving speed      -> 3km/h
+      : Power update      -> 100ms
+      : Reset location    -> every 100 samples
+    --------------------------------------------
+
+
+    Each channel is time varying according to speed
+
+    Location of all users are initialized every 1000 samples.
+
+    The location of CUE for each band is different
+
+    The output looks like as follows:
+
+    output[Sample][Channel][Users][Users]
+
+
+    Example for 2 D2D and 1 CUE channel   :
+    [
+        h_{D2D_1 -> D2D_1}        h_{D2D_1->D2D_2}          h_{D2D_1->BS}
+        h_{D2D_2 -> D2D_1}        h_{D2D_2->D2D_2}          h_{D2D_2->CUE}
+        h_{CUE -> D2D_1}          h_{CUE->D2D_2}            h_{CUE->BS}
+    ]
+
+
+    Accordingly, output[0] returns the first sample
+    output[0][0] return the (N+1) X (N+1) channel gain for first band
+
+'''
+
+
+def ch_gen(Size_area, D2D_dist, Num_D2D, Num_Ch, Num_samples, Delta_mov=0.0833, PL_alpha=38., PL_const=34.5):
+    ch_w_fading = []
+
+    ## Perform initialization just once and the rest channel is generated by moving users
+    rx_loc, tx_loc, tx_loc_CUE = loc_init(Size_area, D2D_dist, Num_D2D, Num_Ch)
+
+    ## Calculate the
+    for i in range(Num_samples):
+
+        ##############################################################
+        ##############################################################
+        #######
+        ####### EDITED 2019-07-10
+        #######
+        ####### DO NOT CONSIDER CORRELATION IN DISTANCE
+        ##############################################################
+        ##############################################################
+        #rx_loc, tx_loc, tx_loc_CUE = loc_update(Size_area, D2D_dist, rx_loc, tx_loc, tx_loc_CUE, Delta_mov)
+
+        if i % 1 == 0:
+            rx_loc, tx_loc, tx_loc_CUE = loc_init(Size_area, D2D_dist, Num_D2D, Num_Ch)
+
+        ch_w_temp_band = []
+        for j in range(Num_Ch):
+            tx_loc_with_CUE = np.vstack((tx_loc, tx_loc_CUE[j]))
+            ## generate distance_vector
+            dist_vec = rx_loc.reshape(Num_D2D + 1, 1, 2) - tx_loc_with_CUE
+            dist_vec = np.linalg.norm(dist_vec, axis=2)
+            dist_vec = np.maximum(dist_vec, 5)
+
+            # find path loss // shadowing is not considered
+            pu_ch_gain_db = - PL_const - PL_alpha * np.log10(dist_vec)
+            pu_ch_gain = 10 ** (pu_ch_gain_db / 10)
+
+            multi_fading = 0.5 * np.random.randn(Num_D2D + 1, Num_D2D + 1) ** 2 + 0.5 * np.random.randn(Num_D2D + 1,
+                                                                                                        Num_D2D + 1) ** 2
+            final_ch = np.maximum(pu_ch_gain * multi_fading, np.exp(-30))
+            ch_w_temp_band.append(np.transpose(final_ch))
+
+        ch_w_fading.append(ch_w_temp_band)
+    return ch_w_fading
+
+
+'''
+Find the optimal value for one sample with one channel
+
+The shape of input channel is as follows:
+
+    -> channel[users][users]
+
+Note that i
+
+    Example for 2 D2D and 1 CUE channel   :
+    [
+        h_{D2D_1 -> D2D_1}        h_{D2D_1->D2D_2}          h_{D2D_1->BS}
+        h_{D2D_2 -> D2D_1}        h_{D2D_2->D2D_2}          h_{D2D_2->BS}
+        h_{CUE -> D2D_1}          h_{CUE->D2D_2}            h_{CUE->BS}
+    ]
+
+
+'''
+
+
+def cal_SINR_one_sample_one_channel(channel, tx_power, noise):
+    ## Note that we transpose the channel to
+    diag_ch = np.diag(channel)
+    inter_ch = channel-np.diag(diag_ch)
+    tot_ch = np.multiply(channel, np.expand_dims(tx_power, -1))
+    int_ch = np.multiply(inter_ch, np.expand_dims(tx_power, -1))
+    sig_ch = np.sum(tot_ch-int_ch, axis=1)
+    int_ch = np.sum(int_ch, axis=1)
+
+    SINR_val = np.divide(sig_ch, int_ch+noise)
+    cap_val = np.log(1.0+SINR_val)
+    return cap_val
+
+
+'''
+Find all possible combination
+
+How to use it?
+
+>> optimal_power(channel, granuity of transmit power, noise, CUE_thr)
+
+CUE_thr: Determine the minimum data rate required for CUE
+DUE_thr: Determine the minimum data rate required for D2D user
+
+Returned value is the sum of all D2D users
+
+
+'''
+
+'''
+Find all possible combination
+
+How to use it?
+
+>> optimal_power(channel, granuity of transmit power, noise, CUE_thr)
+
+CUE_thr: Determine the minimum data rate required for CUE
+DUE_thr: Determine the minimum data rate required for D2D user
+
+Returned value is the sum of all D2D users
+
+
+'''
+
+
+
+'''
+
+ OLD_CODE
+
+
+def cal_rate_NP(channel, tx_power_in, tx_max, noise, DUE_thr, CUE_thr):
+    num_sample = channel.shape[0]
+    num_channel = channel.shape[1]
+    ## Note that the num_user i
+    num_D2D_user = channel.shape[2] - 1
+    tot_cap = 0
+    tot_cap_CUE_vio = 0
+    tot_cap_DUE_vio = 0
+    tot_cap_CUE_vio_num = 0.001
+    tot_cap_DUE_vio_num = 0.001
+    DUE_violation = 0
+    CUE_violation = 0
+    # tot_success_prob counts the number of successful samples
+    tot_success_prob = 0
+    tx_power = np.hstack((tx_power_in, tx_max * np.ones((tx_power_in.shape[0], 1, num_channel))))
+
+    for i in range(num_sample):
+        cur_cap = 0
+        DUE_mask = 1
+        CUE_mask = 1
+
+        for j in range(num_channel):
+            cur_ch = channel[i][j]
+            cur_power = tx_power[i, :, j]
+            cur_power = np.array([cur_power])
+            cur_ch_cap = cal_SINR_one_sample_one_channel(cur_ch, cur_power, noise)
+            cur_cap = cur_cap + cur_ch_cap[0]
+            CUE_mask = CUE_mask * (cur_ch_cap[0, num_D2D_user] > CUE_thr)
+            if cur_ch_cap[0, num_D2D_user] < CUE_thr:
+                tot_cap_CUE_vio = tot_cap_CUE_vio + cur_ch_cap[0, num_D2D_user]
+                tot_cap_CUE_vio_num = tot_cap_CUE_vio_num + 1
+
+        for j in range(num_D2D_user):
+            DUE_mask = DUE_mask * (cur_cap[j] > DUE_thr)
+            if cur_cap[j] < DUE_thr:
+                tot_cap_DUE_vio = tot_cap_DUE_vio + cur_cap[j]
+                tot_cap_DUE_vio_num = tot_cap_DUE_vio_num + 1
+
+        D2D_sum = np.sum(cur_cap[:-1])
+        CUE_sum = np.sum(cur_cap[-1:])
+
+        D2D_sum_filter = D2D_sum * CUE_mask * DUE_mask
+
+        if np.sum(CUE_mask) == 0:
+            CUE_violation = CUE_violation + 1
+
+        if np.sum(DUE_mask) == 0:
+            DUE_violation = DUE_violation + 1
+
+        max_cap = D2D_sum_filter
+
+        if max_cap != 0:
+            tot_success_prob += 1
+
+        tot_cap = tot_cap + max_cap
+
+    tot_cap_DUE_vio = tot_cap_DUE_vio / tot_cap_DUE_vio_num
+    tot_cap_CUE_vio = tot_cap_CUE_vio / tot_cap_CUE_vio_num
+
+    return tot_cap / tot_success_prob / num_D2D_user, DUE_violation / num_sample, CUE_violation / num_sample, tot_cap_DUE_vio, tot_cap_CUE_vio
+'''
+
+
+def cal_rate_NP(channel, tx_power_in, tx_max, noise, DUE_thr, CUE_thr):
+    num_sample = channel.shape[0]
+    num_channel = channel.shape[1]
+
+    ## Note that the num_user i
+    num_D2D_user = channel.shape[2] - 1
+    tot_cap = 0
+    tot_cap_CUE = 0
+    tot_cap_filter = 0
+    tot_cap_CUE_vio = 0
+    tot_cap_DUE_vio = 0
+    tot_cap_CUE_vio_num = 0.001
+    tot_cap_DUE_vio_num = 0.001
+
+    DUE_violation = 0
+    CUE_violation = 0
+
+    # tot_success_prob counts the number of successful samples
+    tot_success_prob = 0
+    tx_power = np.hstack((tx_power_in, tx_max * np.ones((tx_power_in.shape[0], 1, num_channel))))
+
+    for i in range(num_sample):
+        cur_cap = 0
+        DUE_mask = 1
+        CUE_mask = 1
+
+        for j in range(num_channel):
+            cur_ch = channel[i][j]
+
+            cur_power = tx_power[i, :, j]
+            cur_power = np.array([cur_power])
+            cur_ch_cap = cal_SINR_one_sample_one_channel(cur_ch, cur_power, noise)
+            cur_cap = cur_cap + cur_ch_cap[0]
+            CUE_mask = CUE_mask * (cur_ch_cap[0, num_D2D_user] > CUE_thr)
+            if cur_ch_cap[0, num_D2D_user] < CUE_thr:
+                tot_cap_CUE_vio = tot_cap_CUE_vio + cur_ch_cap[0, num_D2D_user]
+                tot_cap_CUE_vio_num = tot_cap_CUE_vio_num + 1
+
+        for j in range(num_D2D_user):
+            DUE_mask = DUE_mask * (cur_cap[j] > DUE_thr)
+            if cur_cap[j] < DUE_thr:
+                tot_cap_DUE_vio = tot_cap_DUE_vio + cur_cap[j]
+                tot_cap_DUE_vio_num = tot_cap_DUE_vio_num + 1
+
+        D2D_sum = np.sum(cur_cap[:-1])
+        CUE_sum = np.sum(cur_cap[-1])
+
+        D2D_sum_filter = D2D_sum * CUE_mask * DUE_mask
+
+        if np.sum(CUE_mask) == 0:
+            CUE_violation = CUE_violation + 1
+
+        if np.sum(DUE_mask) == 0:
+            DUE_violation = DUE_violation + 1
+
+        max_cap_filter = D2D_sum_filter
+        max_cap = D2D_sum
+
+        if max_cap_filter != 0:
+            tot_success_prob += 1
+
+        tot_cap = tot_cap + max_cap
+        tot_cap_CUE = tot_cap_CUE + CUE_sum
+        tot_cap_filter = tot_cap_filter + max_cap_filter
+
+    ############################################################################
+    ## Normalize the output
+    ## CAP_DUE_vio           : capacity of DUE which does not satisfiy the constraint
+    ## CAP_CUE_vio           : capacity of CUE which does not satisfiy the constraint
+    ## CAP_DUE_vio           : probabiilty of violated DUE constraint
+    ## CAP_CUE_vio           : probabiilty of violated CUE constraint
+    ## CAP_DUE_vio           : probabiilty of violated DUE constraint
+    ###########################################################################
+    CAP_DUE_vio = tot_cap_DUE_vio / tot_cap_DUE_vio_num
+    CAP_CUE_vio = tot_cap_CUE_vio / tot_cap_CUE_vio_num
+    PRO_DUE_vio = tot_cap_DUE_vio_num / (num_sample * num_D2D_user)
+    PRO_CUE_vio = tot_cap_CUE_vio_num / (num_sample * num_channel)
+    CAP_TOT = tot_cap / num_D2D_user / num_sample
+    CAP_TOT_CUE = tot_cap_CUE / num_channel / num_sample
+    CAP_TOT_FIL = tot_cap_filter / num_D2D_user / tot_success_prob
+
+    return CAP_TOT, CAP_TOT_FIL, CAP_TOT_CUE, PRO_CUE_vio, PRO_DUE_vio, CAP_CUE_vio, CAP_DUE_vio
+
+
+'''
+    Determine the possible transmit power combination for one user
+    If The power is divided by the granu value
+    Example: if granu is 2 and num_channel is 2 the following outputs will occur
+
+    OUTPUT =>>
+    array([[0. , 0. ],
+           [0.5, 0. ],
+           [1. , 0. ],
+           [0. , 0.5],
+           [0. , 1. ]])
+
+
+'''
+
+
+
+
+def temp_power_function(granuity, num_channel):
+    returned_array = []
+    total_iteration = int(granuity * num_channel + 1)
+    returned_array.append(np.zeros((num_channel,)))
+    for i in range(total_iteration - 1):
+        temp_iter = np.zeros((num_channel,))
+        selected_chanel = i // granuity
+        selected_power_val = i % granuity
+        temp_iter[selected_chanel] = (selected_power_val + 1) / granuity
+        returned_array.append(temp_iter)
+    return np.array(returned_array)
+
+
+
+
+'''
+    Find all possible combination
+    Use product to find combination
+'''
+
+
+def all_possible_tx_power(num_channel, num_user, granuty):
+    possible_power_for_one_user = np.arange(num_channel * granuty + 1)
+    a = np.arange(num_channel * granuty + 1) + 1
+    all_possible_int = np.array(list(product(a, repeat=num_user))) - 1
+    return temp_power_function(granuty, num_channel)[all_possible_int]
+
+
+'''
+Find all possible combination
+
+How to use it?
+
+>> optimal_power(channel, granuity of transmit power, noise, CUE_thr)
+
+CUE_thr: Determine the minimum data rate required for CUE
+DUE_thr: Determine the minimum data rate required for D2D user
+
+Returned value is the sum of all D2D users AND POWER val
+
+
+'''
+
+
+def optimal_power(channel, tx_max, granuty, noise, DUE_thr, CUE_thr, tx_power_set):
+    num_channel = channel.shape[1]
+    ## Note that the num_user i
+    num_D2D_user = channel.shape[2] - 1
+    num_samples = channel.shape[0]
+    tot_cap = 0
+    tot_cap_CUE = 0
+    power_mat = []
+
+    # tot_success_prob counts the number of successful samples
+    tot_success_prob = 0
+
+    ### IMPORTANT: 2019-02-17
+    ### Granuity should be change to include minus 1
+
+    tx_power = tx_power_set
+    print(tx_power.shape)
+
+    tx_power = tx_max * np.hstack((tx_power, np.ones((tx_power.shape[0], 1, num_channel))))
+
+    for i in range(num_samples):
+        cur_cap = 0
+        DUE_mask = 1
+        CUE_mask = 1
+
+        for j in range(num_channel):
+            cur_ch = channel[i][j]
+            cur_ch_cap = cal_SINR_one_sample_one_channel(cur_ch, tx_power[:, :, j], noise)
+            cur_cap = cur_cap + cur_ch_cap
+            CUE_mask = CUE_mask * (cur_ch_cap[:, num_D2D_user] > CUE_thr)
+
+        for j in range(num_D2D_user):
+            DUE_mask = DUE_mask * (cur_cap[:, j] > DUE_thr)
+        D2D_sum = np.sum(cur_cap[:, :-1], axis=1)
+        CUE_sum = np.sum(cur_cap[:, -1:], axis=1)
+
+        D2D_sum = D2D_sum * CUE_mask * DUE_mask
+
+        max_cap = np.max(D2D_sum)
+        max_arg = np.argmax(D2D_sum)
+        max_cap_CUE = CUE_sum[max_arg]
+
+        if max_cap != 0:
+            tot_success_prob += 1
+            power_mat.append(tx_power[max_arg][:-1])
+        else:
+            power_mat.append(np.zeros(tx_power[0].shape)[:-1])
+
+
+        tot_cap = tot_cap + max_cap
+        tot_cap_CUE = tot_cap_CUE + max_cap_CUE
+
+    return tot_cap / num_samples / num_D2D_user, tot_cap_CUE / num_samples / num_channel, np.array(power_mat)
+
+
+'''
+    This function is used to divide feasible channels and infeasible channels
+'''
+'''
+    This function is used to divide feasible channels and infeasible channels
+'''
+
+
+def optimal_power_check_valid(channel, tx_max, granuty, noise, DUE_thr, CUE_thr):
+    num_channel = channel.shape[1]
+    ## Note that the num_user i
+    num_D2D_user = channel.shape[2] - 1
+
+    ## Feasible
+    feasible_channel_mat = []
+    infeasible_channel_mat = []
+
+    # tot_success_prob counts the number of successful samples
+    tx_power = np.zeros((1, num_D2D_user, num_channel))
+    tx_power = tx_max * np.hstack((tx_power, np.ones((tx_power.shape[0], 1, num_channel))))
+
+    for i in range(channel.shape[0]):
+        cur_cap = 0
+        CUE_mask = 1
+
+        for j in range(num_channel):
+            cur_ch = channel[i][j]
+            cur_ch_cap = cal_SINR_one_sample_one_channel(cur_ch, tx_power[:, :, j], noise)
+            cur_cap = cur_cap + cur_ch_cap
+            CUE_mask = CUE_mask * (cur_ch_cap[:, num_D2D_user] > CUE_thr)
+
+        if CUE_mask != 0:
+            feasible_channel_mat.append(channel[i])
+        else:
+            infeasible_channel_mat.append(channel[i])
+
+    return np.array(feasible_channel_mat), np.array(infeasible_channel_mat)
+
+
+'''
+    This function is used to divide feasible channels and infeasible channels
+'''
+
+
+def convert_optimal_power(tx_power_mat, tx_max, Num_power_level, Num_channel):
+    num_samples = tx_power_mat.shape[0]
+    num_user = tx_power_mat.shape[1]
+    resource_alloc = []
+    for i in range(num_samples):
+        resource_alloc_inner = []
+        for j in range(num_user):
+            channel_select = np.argmax(tx_power_mat[i, j])
+            power_select = np.round(tx_power_mat[i, j, channel_select] / tx_max * (Num_power_level - 1))
+            resource_alloc_mat = np.zeros((Num_power_level + Num_channel,))
+            resource_alloc_mat[int(power_select)] = 1
+            resource_alloc_mat[int(Num_power_level + channel_select)] = 1
+            resource_alloc_inner.append(resource_alloc_mat)
+        resource_alloc.append(np.array(resource_alloc_inner))
+    return np.array(resource_alloc)
+
+
+'''
+Find random power
+'''
+
+
+def random_power(channel, tx_max, granuty, noise, DUE_thr, CUE_thr, tx_power_set):
+    num_sample = channel.shape[0]
+    num_channel = channel.shape[1]
+    ## Note that the num_user i
+    num_D2D_user = channel.shape[2] - 1
+    tot_cap = 0
+    tot_cap_CUE = 0
+    tot_cap_filter = 0
+    tot_cap_CUE_vio = 0
+    tot_cap_DUE_vio = 0
+    tot_cap_CUE_vio_num = 0.001
+    tot_cap_DUE_vio_num = 0.001
+    DUE_violation = 0
+    CUE_violation = 0
+    # tot_success_prob counts the number of successful samples
+    tot_success_prob = 0
+
+    tx_power = tx_power_set
+    tx_power = tx_max * np.hstack((tx_power, np.ones((tx_power.shape[0], 1, num_channel))))
+
+    for i in range(num_sample):
+        cur_cap = 0
+        DUE_mask = 1
+        CUE_mask = 1
+        tx_power_select = tx_power[np.random.permutation(tx_power.shape[0])[0]]
+
+        for j in range(num_channel):
+            cur_ch = channel[i][j]
+            cur_ch_cap = cal_SINR_one_sample_one_channel(cur_ch, tx_power_select[:, j], noise)
+            cur_cap = cur_cap + cur_ch_cap
+            CUE_mask = CUE_mask * (cur_ch_cap[num_D2D_user] > CUE_thr)
+            if cur_ch_cap[num_D2D_user] < CUE_thr:
+                tot_cap_CUE_vio = tot_cap_CUE_vio + cur_ch_cap[num_D2D_user]
+                tot_cap_CUE_vio_num = tot_cap_CUE_vio_num + 1
+
+        for j in range(num_D2D_user):
+            DUE_mask = DUE_mask * (cur_cap[j] > DUE_thr)
+            if cur_cap[j] < DUE_thr:
+                tot_cap_DUE_vio = tot_cap_DUE_vio + cur_cap[j]
+                tot_cap_DUE_vio_num = tot_cap_DUE_vio_num + 1
+
+        D2D_sum = np.sum(cur_cap[:-1])
+        CUE_sum = np.sum(cur_cap[-1])
+        D2D_sum_filter = D2D_sum * CUE_mask * DUE_mask
+
+        if np.sum(CUE_mask) == 0:
+            CUE_violation = CUE_violation + 1
+
+        if np.sum(DUE_mask) == 0:
+            DUE_violation = DUE_violation + 1
+
+        max_cap_filter = D2D_sum_filter
+        max_cap = D2D_sum
+        max_cap_CUE = CUE_sum
+
+        if max_cap_filter != 0:
+            tot_success_prob += 1
+
+        tot_cap = tot_cap + max_cap
+        tot_cap_CUE = tot_cap_CUE + max_cap_CUE
+        tot_cap_filter = tot_cap_filter + max_cap_filter
+
+    ############################################################################
+    ## Normalize the output
+    ## CAP_DUE_vio           : capacity of DUE which does not satisfiy the constraint
+    ## CAP_CUE_vio           : capacity of CUE which does not satisfiy the constraint
+    ## CAP_DUE_vio           : probabiilty of violated DUE constraint
+    ## CAP_CUE_vio           : probabiilty of violated CUE constraint
+    ## CAP_DUE_vio           : probabiilty of violated DUE constraint
+    ###########################################################################
+    CAP_DUE_vio = tot_cap_DUE_vio / tot_cap_DUE_vio_num
+    CAP_CUE_vio = tot_cap_CUE_vio / tot_cap_CUE_vio_num
+    PRO_DUE_vio = tot_cap_DUE_vio_num / (num_sample * num_D2D_user)
+    PRO_CUE_vio = tot_cap_CUE_vio_num / (num_sample * num_channel)
+    CAP_TOT = tot_cap / num_D2D_user / num_sample
+    CAP_TOT_CUE = tot_cap_CUE / num_channel / num_sample
+    CAP_TOT_FIL = tot_cap_filter / num_D2D_user / tot_success_prob
+
+    return CAP_TOT, CAP_TOT_FIL, CAP_TOT_CUE, PRO_CUE_vio, PRO_DUE_vio, CAP_CUE_vio, CAP_DUE_vio
+
+
+def convert_TX_power(chan_num, user_num, power_granu, tf_output, tx_max):
+    ## Output of DNN should be divided proerly.
+    ## [power alloc, resource alloc on channel]
+    power_mat = np.arange(power_granu) / (power_granu - 1)
+    tx_pow_level = tf_output[:, :, :-chan_num] * power_mat
+    tx_pow_level_tot = np.sum(tx_pow_level, axis=2) * tx_max
+    tx_pow_level_tot = np.reshape(tx_pow_level_tot, [-1, user_num, 1])
+    tx_pow_chan = np.multiply(tf_output[:, :, -chan_num:], tx_pow_level_tot)
+    return tx_pow_chan
+
+
+def transform_tx_power(tx_power_mat, Num_power_level, tx_max):
+    maximum_val = tx_power_mat.max(axis=2)
+    maximum_val = maximum_val.reshape(tx_power_mat.shape[0], tx_power_mat.shape[1], 1)
+    selected_power = (tx_power_mat == maximum_val).astype(float)
+    return np.round(selected_power * tx_power_mat / tx_max * (Num_power_level - 1)) / (Num_power_level - 1) * tx_max
+
+
+
+
+
+'''
+
+    LOSS MODELS
+
+'''
+
+
+'''
+    This function calculates the capacity of D2D users and CUE user
+    The return of this function is D2D capacity and CUE capacity
+    Capacity for each channel is acculmulated.
+
+    The shape of return is as follows:
+
+    [Num_sample, Num_users]
+
+    The output will be capacity of D2D and capacity of CUE
+
+'''
+
+
+def cal_RATE_tf(channel, tx_power, tx_max, noise, num_samples, log_data_mean, log_data_std):
+    chan_num = channel.shape[1]
+    user_num = channel.shape[2]
+    cap_val = tf.constant(0.0)
+    CUE_cap = []
+
+    channel_rev = tf.exp(channel * log_data_std + log_data_mean)
+
+    for i in range(chan_num):
+        tx_power_w_CUE = tf.concat([tx_power[:, :, i], tx_max * tf.ones((num_samples, 1))], axis=1)
+        tot_ch = tf.multiply(channel_rev[:, i], tf.expand_dims(tx_power_w_CUE, -1))
+        sig_ch = tf.linalg.diag_part(tot_ch)
+        inter_ch = tot_ch - tf.linalg.diag(sig_ch)
+        inter_ch = tf.reduce_sum(inter_ch, axis=1)
+        SINR_val = tf.div(sig_ch, inter_ch + noise)
+        cap_val = cap_val + tf.log(tf.constant(1.0) + SINR_val)
+        CUE_cap.append(tf.log(tf.constant(1.0) + SINR_val)[:, -1])
+
+    cap_val_D2D = cap_val[:, :user_num - 1]
+    return cap_val_D2D, tf.transpose(tf.convert_to_tensor(CUE_cap))
+
+
+
+
+def cal_EE_tf(cap_val_D2D, tx_power, p_c):
+    tx_power_d2d = tf.reduce_sum(tx_power, axis=1)[:, :-1]
+    EE = tf.div(cap_val_D2D, tx_power_d2d + p_c)
+    return EE
+
+
+
+
+
+
+
+def cal_LOSS_Total_tf(channel, tf_output, noise, DUE_thr, CUE_thr, tx_max, num_samples, log_data_mean, log_data_std,
+                      lambda_mat):
+    ## Output of DNN should be divided proerly.
+    ## [power alloc, resource alloc on channel]
+    chan_num = int(channel.shape[1])
+    user_num = int(channel.shape[2] - 1)
+    power_granu = int(Num_power_level)
+    power_mat = tf.constant(np.arange(power_granu) / (power_granu - 1), dtype=tf.float32)
+
+    tx_pow_level = tf_output[:, :, :power_granu] * power_mat
+    tx_pow_level_tot = tf.reduce_sum(tx_pow_level, axis=2) * tx_max
+    tx_pow_level_tot = tf.reshape(tx_pow_level_tot, [-1, user_num, 1])
+    tx_pow_chan = tf.multiply(tf_output[:, :, power_granu:power_granu+chan_num], tx_pow_level_tot)
+
+    D2D_rate, CUE_rate = cal_RATE_tf(channel, tx_pow_chan, tx_max, noise, num_samples, log_data_mean, log_data_std)
+
+    CUE_vio = tf.nn.relu(CUE_thr - CUE_rate) / (CUE_thr + 1e-10)
+    integer_vio_1 = -tf.reduce_sum(tf.abs(tf_output[:, :, :power_granu+chan_num] - 0.5))
+    integer_vio_2 = -tf.reduce_sum(tf.abs(tf_output[:, :, power_granu + chan_num:] - 0.5))
+    CUE_vio_sum = tf.reduce_sum(CUE_vio)
+
+    Loss = - tf.reduce_sum(lambda_mat[0] * D2D_rate)  + lambda_mat[1] * CUE_vio_sum + lambda_mat[2] * integer_vio_1 + lambda_mat[3] * integer_vio_2
+    return Loss
+
+
+
+
+
+
+def cal_LOSS_rate_tf(channel, tf_output, noise, DUE_thr, CUE_thr, tx_max, num_samples, log_data_mean, log_data_std,
+                     lambda_mat):
+    chan_num = int(channel.shape[1])
+    user_num = int(channel.shape[2] - 1)
+    power_granu = int(Num_power_level)
+    power_mat = tf.constant(np.arange(power_granu) / (power_granu - 1), dtype=tf.float32)
+    tx_pow_level = tf_output[:, :, :power_granu] * power_mat
+    tx_pow_level_tot = tf.reduce_sum(tx_pow_level, axis=2) * tx_max
+    tx_pow_level_tot = tf.reshape(tx_pow_level_tot, [-1, user_num, 1])
+    tx_pow_chan = tf.multiply(tf_output[:, :, power_granu:power_granu+chan_num], tx_pow_level_tot)
+
+
+    cap_val = tf.constant(0.0)
+    CUE_cap = []
+
+    channel_rev = tf.exp(channel * log_data_std + log_data_mean)
+
+    for i in range(chan_num):
+        tx_power_w_CUE = tf.concat([tx_pow_chan[:, :, i], tx_max * tf.ones((num_samples, 1))], axis=1)
+        tot_ch = tf.multiply(channel_rev[:, i], tf.expand_dims(tx_power_w_CUE, -1))
+        sig_ch = tf.linalg.diag_part(tot_ch)
+        inter_ch = tot_ch - tf.linalg.diag(sig_ch)
+        inter_ch = tf.reduce_sum(inter_ch, axis=1)
+        SINR_val = tf.div(sig_ch, inter_ch + noise)
+        cap_val = cap_val + tf.reduce_sum(tf.log(tf.constant(1.0) + SINR_val[:, :-1]))
+
+    Loss = cap_val
+    return Loss
+
+
+
+def cal_LOSS_2_rate_tf(channel, tf_output, noise, DUE_thr, CUE_thr, tx_max, num_samples, log_data_mean, log_data_std,
+                     lambda_mat):
+    chan_num = int(channel.shape[1])
+    user_num = int(channel.shape[2] - 1)
+    power_granu = int(Num_power_level)
+    power_mat = tf.constant(np.arange(power_granu) / (power_granu - 1), dtype=tf.float32)
+    tx_pow_level = tf_output[:, :, :power_granu] * power_mat
+    tx_pow_level_tot = tf.reduce_sum(tx_pow_level, axis=2) * tx_max
+    tx_pow_level_tot = tf.reshape(tx_pow_level_tot, [-1, user_num, 1])
+    tx_pow_chan = tf.multiply(tf_output[:, :, power_granu:power_granu+chan_num], tx_pow_level_tot)
+
+    D2D_rate, CUE_rate = cal_RATE_tf(channel, tx_pow_chan, tx_max, noise, num_samples, log_data_mean, log_data_std)
+
+    Loss = D2D_rate
+    return Loss
+
+
+
+
+def cal_LOSS_DUE_CONST_tf(channel, tf_output, noise, DUE_thr, CUE_thr, tx_max, num_samples, log_data_mean, log_data_std,
+                      lambda_mat):
+    ## Output of DNN should be divided proerly.
+    ## [power alloc, resource alloc on channel]
+    chan_num = int(channel.shape[1])
+    user_num = int(channel.shape[2] - 1)
+    power_granu = int(Num_power_level)
+    power_mat = tf.constant(np.arange(power_granu) / (power_granu - 1), dtype=tf.float32)
+    tx_pow_level = tf_output[:, :, :power_granu] * power_mat
+    tx_pow_level_tot = tf.reduce_sum(tx_pow_level, axis=2) * tx_max
+    tx_pow_level_tot = tf.reshape(tx_pow_level_tot, [-1, user_num, 1])
+    tx_pow_chan = tf.multiply(tf_output[:, :, power_granu:power_granu+chan_num], tx_pow_level_tot)
+
+    D2D_rate, CUE_rate = cal_RATE_tf(channel, tx_pow_chan, tx_max, noise, num_samples, log_data_mean, log_data_std)
+    D2D_vio = tf.cast(DUE_thr>D2D_rate, tf.float32)
+    D2D_vio_sum = tf.reduce_mean(D2D_vio, axis=1)
+    Loss = D2D_vio_sum
+
+    return Loss
+
+
+
+
+def cal_LOSS_CUE_CONST_tf(channel, tf_output, noise, DUE_thr, CUE_thr, tx_max, num_samples, log_data_mean, log_data_std,
+                      lambda_mat):
+    ## Output of DNN should be divided proerly.
+    ## [power alloc, resource alloc on channel]
+    chan_num = int(channel.shape[1])
+    user_num = int(channel.shape[2] - 1)
+    power_granu = int(Num_power_level)
+    power_mat = tf.constant(np.arange(power_granu) / (power_granu - 1), dtype=tf.float32)
+    tx_pow_level = tf_output[:, :, :power_granu] * power_mat
+
+    ## tx_pow_level_tot determines the TOTAL TRANSMIT POWER of each user
+    tx_pow_level_tot = tf.reduce_sum(tx_pow_level, axis=2) * tx_max
+    tx_pow_level_tot = tf.reshape(tx_pow_level_tot, [-1, user_num, 1])
+    tx_pow_chan = tf.multiply(tf_output[:, :, power_granu:power_granu+chan_num], tx_pow_level_tot)
+
+    D2D_rate, CUE_rate = cal_RATE_tf(channel, tx_pow_chan, tx_max, noise, num_samples, log_data_mean, log_data_std)
+
+    CUE_vio = tf.cast(CUE_thr>CUE_rate, tf.float32)
+    CUE_vio_sum = tf.reduce_mean(CUE_vio, axis=1)
+    Loss = CUE_vio_sum
+    return Loss
+
+
+
+
+
+'''
+    This function calculates the loss for RATE
+'''
+
+
+
+def cal_LOSS_init_tf(channel, tf_output, y_true):
+    chan_num = int(channel.shape[1])
+    user_num = int(channel.shape[2] - 1)
+    power_granu = int(Num_power_level)
+
+    power_alloc_pre = tf_output[:, :, :power_granu]
+    chan_alloc_pre = tf_output[:, :, power_granu:power_granu+chan_num]
+
+    power_alloc_true = y_true[:, :, :-chan_num]
+    chan_alloc_true = y_true[:, :, -chan_num:]
+
+    Loss_1 = tf.nn.softmax_cross_entropy_with_logits_v2(labels=power_alloc_true, logits=power_alloc_pre)
+    Loss_2 = tf.nn.softmax_cross_entropy_with_logits_v2(labels=chan_alloc_true, logits=chan_alloc_pre)
+    """
+    Loss_3 = -tf.reduce_mean(tf.reduce_mean(tf.pow(tf_output[:, :, power_granu + chan_num:]-0.5, 4), axis=2))
+    if tf_output.shape[2] == power_granu + chan_num:
+        temp_const = tf.constant(0.0)
+    else:
+        temp_const = tf.constant(0.8)
+    """
+    Loss_3 = -tf.reduce_mean(tf.reduce_mean(tf.pow(tf_output- 0.5, 4), axis=2))
+    Loss = Loss_1 + Loss_2 + Loss_3
+    #Loss = Loss_1 + Loss_2
+    return Loss
+
+
+
+
+def Total_loss_wrapper(input_tensor, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean, log_data_std, lambda_mat):
+    def TOTAL_loss(y_true, y_pred):
+        Loss = cal_LOSS_Total_tf(input_tensor, y_pred, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean, log_data_std, lambda_mat)
+        return Loss
+    return TOTAL_loss
+
+
+def Rate_loss_wrapper(input_tensor, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean, log_data_std, lambda_mat):
+    def RATE_loss(y_true, y_pred):
+        Loss = cal_LOSS_rate_tf(input_tensor, y_pred, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean, log_data_std, lambda_mat)
+        return Loss
+    return RATE_loss
+
+
+def Rate_loss_2_wrapper(input_tensor, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean, log_data_std, lambda_mat):
+    def RATE_loss_2(y_true, y_pred):
+        Loss = cal_LOSS_2_rate_tf(input_tensor, y_pred, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean, log_data_std, lambda_mat)
+        return Loss
+    return RATE_loss_2
+
+
+
+def INT_CONST_loss_wrapper(input_tensor):
+    def INT_loss(y_true, y_pred):
+        chan_num = int(input_tensor.shape[1])
+        rounded_value = tf.round(y_pred)
+        Loss = tf.reduce_sum(tf.square(y_pred-rounded_value))
+        return Loss
+    return INT_loss
+
+
+def RA_CONST_loss_wrapper(input_tensor):
+    def RA_loss(y_true, y_pred):
+        chan_num = int(input_tensor.shape[1])
+        rounded_value = tf.round(y_pred)
+        Loss = tf.reduce_mean(tf.reduce_mean(tf.square(y_pred[:,:,-chan_num:]-rounded_value[:,:,-chan_num:]), axis=2), axis=1)
+        return Loss
+    return RA_loss
+
+
+def DUE_CONST_loss_wrapper(input_tensor, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean, log_data_std, lambda_mat):
+    def DUE_loss(y_true, y_pred):
+        Loss = cal_LOSS_DUE_CONST_tf(input_tensor, y_pred, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean,
+                                log_data_std, lambda_mat)
+        return Loss
+    return DUE_loss
+
+def CUE_CONST_loss_wrapper(input_tensor, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean, log_data_std, lambda_mat):
+    def CUE_loss(y_true, y_pred):
+        Loss = cal_LOSS_CUE_CONST_tf(input_tensor, y_pred, noise, DUE_thr, CUE_thr, tx_max, num_sample, log_data_mean,
+                                log_data_std, lambda_mat)
+        return Loss
+    return CUE_loss
+
+def Init_loss_wrapper(input_tensor):
+    def Init_loss(y_true, y_pred):
+        Loss = cal_LOSS_init_tf(input_tensor, y_pred, y_true)
+        return Loss
+    return Init_loss
+
+
+
+
+'''
+
+    DNN MODELS
+
+'''
+
+
+
+
+def DNN_basic_module(Input_layer, Num_weights_inner, Num_outputs, Num_layers=3, activation='relu'):
+    Inner_layer_1 = keras.layers.Dense(Num_weights_inner)(Input_layer)
+    Inner_layer_2 = keras.layers.BatchNormalization()(Inner_layer_1)
+    Inner_layer_3 = keras.layers.Activation('relu')(Inner_layer_2)
+    Inner_layer_in_1 = keras.layers.Dense(Num_weights_inner)(Inner_layer_3)
+
+    for i in range(Num_layers):
+        Inner_layer_in_1 = keras.layers.BatchNormalization()(Inner_layer_in_1)
+        Inner_layer_in_1 = keras.layers.Add()([Inner_layer_1, Inner_layer_in_1])
+        Inner_layer_in_1 = keras.layers.Activation('relu')(Inner_layer_in_1)
+        Inner_layer_in_1 = keras.layers.Dropout(0.02)(Inner_layer_in_1)
+        Inner_layer_in_1 = keras.layers.Dense(Num_weights_inner)(Inner_layer_in_1)
+
+    Inner_layer_in_9_2 = keras.layers.BatchNormalization()(Inner_layer_in_1)
+    Inner_layer_in_9_3 = keras.layers.Add()([Inner_layer_1, Inner_layer_in_9_2])
+    Inner_layer_in_9_4 = keras.layers.Activation('relu')(Inner_layer_in_9_3)
+
+    Out_layer = keras.layers.Dense(Num_outputs)(Inner_layer_in_9_4)
+    return Out_layer
+
+
+
+
+
+
+def DNN_model_dist(Num_channel, Num_user, Num_enc_user, Num_cqi, Num_enc_BS, Num_PC_sig, Num_PC_val, Num_power_level,
+                   Num_RA_val):
+    inputs = tf.keras.Input(shape=(Num_channel, Num_user + 1, Num_user + 1))
+
+    ## By permuting the input channel, it becomes easier to reorganize the channel
+    x = layers.Permute((3, 2, 1))(inputs)
+
+    '''
+        Slicing the channels according to user
+        output becomes as follow
+
+        [
+            [ h_{D2D_1 -> D2D_1}        h_{D2D_2->D2D_1}          h_{CUE->D2D_1} ]
+            [ h_{D2D_1 -> D2D_2}        h_{D2D_2->D2D_2}          h_{CUE->D2D_2} ]
+            [ h_{D2D_1 -> BS}        h_{D2D_2->BS}             h_{CUE->BS}    ]
+        ]
+    '''
+
+    Out_mat_1 = []
+    for i in range(Num_user + 1):
+        out = layers.Lambda(lambda x: x[:, :, i])(x)
+        Out_mat_1.append(out)
+
+    # Concatenating together the per-channel results:
+    Out_mat_1_fin = layers.Concatenate()(Out_mat_1)
+
+    '''
+        Perform independent DNN operation.
+        Weights and biases are not shared among users
+        Channel that can be obtained by the BS can be accumulated
+
+        Num_enc_user: The number of weights in encoding module
+        Num_cqi: Number of CQI
+        Baic number of layer : 3
+        RELU, Batch norm
+    '''
+
+    Out_mat_2 = []
+    Out_mat_cqi = []
+    for i in range(Num_user + 1):
+        user_cqi = layers.Lambda(lambda x: x[:, i])(Out_mat_1_fin)
+        if i != Num_user:
+            out_layer_1 = DNN_basic_module(user_cqi, Num_enc_user, Num_cqi, Num_layers=4)
+            out_layer_1 = layers.Activation('sigmoid')(out_layer_1)
+            Out_mat_cqi.append(out_layer_1)
+        else:
+            out_layer_1 = DNN_basic_module(user_cqi, (Num_user+1)*Num_channel, (Num_user+1)*Num_channel, Num_layers=2)
+
+        Out_mat_2.append(out_layer_1)
+
+
+    # Concatenating to obtain final input to BS
+    # Out_mat_2_fin contains the channel obtained by the BS
+    Out_mat_2_fin = layers.Concatenate()(Out_mat_2)
+
+    Out_mat_cqi_fin = layers.Concatenate()(Out_mat_cqi)
+
+    ## NUM_enc_BS : number of weights in BS
+    ## Num_PC_sig : number signal feedback to users
+    PC_sig = DNN_basic_module(Out_mat_2_fin, Num_enc_BS, Num_PC_sig, Num_layers=4)
+    PC_sig = layers.Activation('sigmoid')(PC_sig)
+
+
+    Out_mat_PC_control_1 = []
+    for i in range(Num_user + 1):
+        out_pc_control = layers.Lambda(lambda x: x[:, :, i])(x)
+        Out_mat_PC_control_1.append(out_pc_control)
+
+    # Concatenating together the per-channel results:
+    Out_mat_PC_control_1_fin = layers.Concatenate()(Out_mat_PC_control_1)
+    Out_mat_PC_control_2 = []
+
+    for i in range(Num_user):
+        Out_temp = []
+        PC_con_temp = layers.Lambda(lambda x: x[:, i])(Out_mat_PC_control_1_fin)
+        RA_con_temp = layers.Lambda(lambda x: x[:, i])(Out_mat_PC_control_1_fin)
+        PC_sig_con_1 = layers.Dense(Num_PC_sig)(PC_sig)
+        PC_sig_con_2 = layers.Dense(Num_PC_sig)(PC_sig)
+
+        PC_con = layers.Concatenate()([PC_con_temp, PC_sig_con_1])
+        PC_con = layers.Flatten()(PC_con)
+        RA_con = layers.Concatenate()([RA_con_temp, PC_sig_con_2])
+        RA_con = layers.Flatten()(RA_con)
+
+        if i != Num_user:
+            ## Determine the power level
+            PC_con_tot = DNN_basic_module(PC_con, Num_PC_val, Num_power_level, Num_layers=8)
+            PC_con_tot = layers.Activation('softmax')(PC_con_tot)
+
+            ## Determine the power level
+            RA_con_tot = DNN_basic_module(RA_con, Num_RA_val, Num_channel, Num_layers=8)
+            RA_con_tot = layers.Activation('softmax')(RA_con_tot)
+
+            Out_temp.append(PC_con_tot)
+            Out_temp.append(RA_con_tot)
+            Out_temp_tot = layers.Concatenate()(Out_temp)
+
+        Out_mat_PC_control_2.append(Out_temp_tot)
+
+
+    result = layers.Concatenate()(Out_mat_PC_control_2)
+    result = layers.Reshape((Num_user, Num_power_level + Num_channel))(result)
+
+    feedbk = layers.Concatenate()([Out_mat_cqi_fin, PC_sig])
+    feedbk = layers.Reshape((Num_user, int(Num_cqi+Num_PC_sig/Num_user) ))(feedbk)
+
+    result_fin = layers.Concatenate()([result, feedbk])
+
+    model = tf.keras.Model(inputs=inputs, outputs=result_fin)
+    return model
+
+
+
+"""
+    Construct model with full CSI
+"""
+
+
+def DNN_model_full(Num_channel, Num_user, Num_power_level, Num_weights, Num_layers=12):
+    inputs = tf.keras.Input(shape=(Num_channel, Num_user + 1, Num_user + 1))
+    inputs_reshape = layers.Flatten(input_shape=(Num_channel, Num_user + 1, Num_user + 1))(inputs)
+
+    ## Find the results for Power level
+    result_PL = DNN_basic_module(inputs_reshape, Num_weights, Num_user * Num_power_level, Num_layers)
+    result_PL = layers.Reshape((Num_user, Num_power_level))(result_PL)
+
+    result_PL = layers.Activation('softmax')(result_PL)
+
+
+    ## Find the results for Resourace allocation
+    result_RA = DNN_basic_module(inputs_reshape, Num_weights, Num_user * Num_channel, Num_layers)
+    result_RA = layers.Reshape((Num_user, Num_channel))(result_RA)
+    result_RA = layers.Activation('softmax')(result_RA)
+
+    result = layers.Concatenate()([result_PL, result_RA])
+
+    model = tf.keras.Model(inputs=inputs, outputs=result)
+
+    return model
+
+
+
+
+
+def Print_DNN_OUT(model, log_data, real_data, Num_channel, Num_user, Num_power_level, tx_max, noise, DUE_thr, CUE_thr, Data_rate_OPT):
+    DNN_out_pre = model.predict(log_data)
+    DNN_out_pre = DNN_out_pre[:,:,:Num_channel+Num_power_level]
+    DNN_out = convert_TX_power(Num_channel, Num_user, Num_power_level, DNN_out_pre, tx_max)
+
+    '''
+    print("result of unnormlized results")
+    CAP_DNN, CAP_FIL_DNN, CAP_CUE, PRO_CUE, __, CAP_CUE_vio, __ = cal_rate_NP(real_data, DNN_out, tx_max, noise, DUE_thr, CUE_thr)
+    print("Rate_DUE = %0.2f  Ratio = %0.2f CUE_RATE = %0.2f, Vio prob = %0.2f  Vio_Rate = %0.2f"%(CAP_DNN/0.6931, CAP_DNN/Data_rate_OPT, CAP_CUE/0.6931, PRO_CUE*100, CAP_CUE_vio/0.6931))
+    print("DNN_out", DNN_out[:10])
+    print("CAP_DNN", CAP_DNN)
+    print("")
+
+    print("result of normlized results")
+    '''
+    DNN_Filter = transform_tx_power(DNN_out, Num_power_level, tx_max)
+    CAP_DNN, CAP_FIL_DNN, CAP_CUE, PRO_CUE, __, CAP_CUE_vio, __ = cal_rate_NP(real_data, DNN_Filter, tx_max, noise, DUE_thr, CUE_thr)
+    print("Rate_DUE = %0.2f  Ratio = %0.2f CUE_RATE = %0.2f, Vio prob = %0.2f  Vio_Rate = %0.2f"%(CAP_DNN/0.6931, CAP_DNN/Data_rate_OPT, CAP_CUE/0.6931, PRO_CUE*100, CAP_CUE_vio/0.6931))
+    print("CAP_DNN", CAP_DNN)
+    print("")
+    return CAP_DNN, CAP_FIL_DNN, CAP_CUE, PRO_CUE, CAP_CUE_vio
+
+
+def Print_NAIVE_DNN_OUT(model, log_data, real_data, Num_channel, Num_user, Num_power_level, tx_max, noise, DUE_thr,
+                        CUE_thr, Data_rate_OPT):
+    for i in range(Num_user):
+        masking_mat = np.zeros(log_data.shape)
+        masking_mat[:, :, :, i] = 1
+        rev_data = masking_mat * log_data
+        DNN_out_pre_ind = model.predict(rev_data)
+        DNN_out_pre_ind = DNN_out_pre_ind[:, :, :Num_channel + Num_power_level]
+        output_temp = DNN_out_pre_ind[:, i, :].reshape(log_data.shape[0], 1, DNN_out_pre_ind.shape[-1])
+        if i == 0:
+            DNN_out_pre = output_temp
+        else:
+            DNN_out_pre = np.hstack((DNN_out_pre, output_temp))
+
+    DNN_out = convert_TX_power(Num_channel, Num_user, Num_power_level, DNN_out_pre, tx_max)
+    DNN_Filter = transform_tx_power(DNN_out, Num_power_level, tx_max)
+    CAP_DNN, CAP_FIL_DNN, CAP_CUE, PRO_CUE, __, CAP_CUE_vio, __ = cal_rate_NP(real_data, DNN_Filter, tx_max, noise,
+                                                                              DUE_thr, CUE_thr)
+    print("Rate_DUE = %0.2f  Ratio = %0.2f CUE_RATE = %0.2f, Vio prob = %0.2f  Vio_Rate = %0.2f" % (
+    CAP_DNN / 0.6931, CAP_DNN / Data_rate_OPT, CAP_CUE / 0.6931, PRO_CUE * 100, CAP_CUE_vio / 0.6931))
+    return CAP_DNN, CAP_FIL_DNN, CAP_CUE, PRO_CUE, CAP_CUE_vio
+
+
+def Print_Test_Full(model_full, model_par_dist, log_data_test, data_test, Num_channel, Num_user, Num_power_level,
+                    tx_max, noise, DUE_thr, CUE_thr, OPT_DUE, OPT_CUE, tx_power_set):
+    CAP_1_MAT = []
+    CAP_2_MAT = []
+    CAP_CUE_MAT = []
+    VIO_PRO_MAT = []
+    VIO_CAP_MAT = []
+
+    ### Full DNN case
+    CAP_1_MAT.append(OPT_DUE)
+    CAP_2_MAT.append(OPT_DUE)
+    CAP_CUE_MAT.append(OPT_CUE)
+    print("Opt.= %0.2f, CUE = %0.2f" % (OPT_DUE / 0.6931, OPT_CUE / 0.6931))
+    print("")
+    print("Full: ", end='')
+    CAP_DNN, CAP_FIL_DNN, CAP_CUE, PRO_CUE, CAP_CUE_vio = Print_DNN_OUT(model_full, log_data_test, data_test,
+                                                                        Num_channel, Num_user, Num_power_level, tx_max,
+                                                                        noise, DUE_thr, CUE_thr,
+                                                                        OPT_DUE)
+
+    CAP_1_MAT.append(CAP_DNN)
+    CAP_2_MAT.append(CAP_FIL_DNN)
+    CAP_CUE_MAT.append(CAP_CUE)
+    VIO_PRO_MAT.append(PRO_CUE * 100)
+    VIO_CAP_MAT.append(CAP_CUE_vio)
+
+    ### Partial DNN case
+    print("")
+    print("Partial: ", end='')
+    CAP_DNN, CAP_FIL_DNN, CAP_CUE, PRO_CUE, CAP_CUE_vio = Print_DNN_OUT(model_par_dist, log_data_test, data_test,
+                                                                        Num_channel, Num_user, Num_power_level, tx_max,
+                                                                        noise, DUE_thr, CUE_thr,
+                                                                        OPT_DUE)
+    CAP_1_MAT.append(CAP_DNN)
+    CAP_2_MAT.append(CAP_FIL_DNN)
+    CAP_CUE_MAT.append(CAP_CUE)
+    VIO_PRO_MAT.append(PRO_CUE * 100)
+    VIO_CAP_MAT.append(CAP_CUE_vio)
+
+    ### NAIVE DNN case
+    print("")
+    print("NAIVE: ", end='')
+    CAP_DNN, CAP_FIL_DNN, CAP_CUE, PRO_CUE, CAP_CUE_vio = Print_NAIVE_DNN_OUT(model_full, log_data_test[:1000], data_test[:1000],
+                                                                              Num_channel, Num_user, Num_power_level,
+                                                                              tx_max, noise, DUE_thr, CUE_thr,
+                                                                              OPT_DUE)
+    CAP_1_MAT.append(CAP_DNN)
+    CAP_2_MAT.append(CAP_FIL_DNN)
+    CAP_CUE_MAT.append(CAP_CUE)
+    VIO_PRO_MAT.append(PRO_CUE * 100)
+    VIO_CAP_MAT.append(CAP_CUE_vio)
+    print("")
+
+    ### Random case
+    CAP_RAN, CAP_FIL_RAN, CAP_CUE, PRO_CUE, __, CAP_CUE_vio, __ = random_power(data_test, tx_max, Num_power_level,
+                                                                               noise, DUE_thr, CUE_thr, tx_power_set)
+    print("Random case: ", end='')
+    print("Rate_DUE = %0.2f  Ratio = %0.2f, Vio prob = %0.2f  Vio_Rate = %0.2f" % (
+    CAP_RAN / 0.6931, CAP_RAN / OPT_DUE, PRO_CUE * 100, CAP_CUE_vio / 0.6931))
+    CAP_1_MAT.append(CAP_RAN)
+    CAP_2_MAT.append(CAP_FIL_RAN)
+    CAP_CUE_MAT.append(CAP_CUE)
+    VIO_PRO_MAT.append(PRO_CUE * 100)
+    VIO_CAP_MAT.append(CAP_CUE_vio)
+
+    return CAP_1_MAT, CAP_2_MAT, CAP_CUE_MAT, VIO_PRO_MAT, VIO_CAP_MAT
+
+
+
+
+
+
+#############################################################################################
+#############################################################################################
+#############################################################################################
+#############################################################################################
+
+## For CDF plot
+def optimal_power_CDF(channel, tx_max, granuty, noise, DUE_thr, CUE_thr, tx_power_set):
+    num_channel = channel.shape[1]
+    num_D2D_user = channel.shape[2] - 1
+    num_samples = channel.shape[0]
+    tx_power = tx_power_set
+    tx_power = tx_max * np.hstack((tx_power, np.ones((tx_power.shape[0], 1, num_channel))))
+    power_mat = []
+    rate_D2D_CDF = []
+    rate_CUE_CDF = []
+    for i in range(num_samples):
+        cur_cap = 0
+        CUE_mask = 1
+        for j in range(num_channel):
+            cur_ch = channel[i][j]
+            cur_ch_cap = cal_SINR_one_sample_one_channel(cur_ch, tx_power[:, :, j], noise)
+            cur_cap = cur_cap + cur_ch_cap
+            CUE_mask = CUE_mask * (cur_ch_cap[:, num_D2D_user] > CUE_thr)
+        D2D_sum = np.sum(cur_cap[:, :-1], axis=1)
+        CUE_sum = np.sum(cur_cap[:, -1:], axis=1)
+        D2D_sum = D2D_sum * CUE_mask
+
+        max_cap = np.max(D2D_sum)
+        max_arg = np.argmax(D2D_sum)
+        max_cap_CUE = CUE_sum[max_arg]
+
+        if np.sum(CUE_mask) != 0:
+            power_mat.append(tx_power[max_arg][:-1])
+            rate_D2D_CDF.append(max_cap/num_D2D_user)
+            rate_CUE_CDF.append(max_cap_CUE/ num_channel)
+    return np.array(rate_D2D_CDF), np.array(rate_CUE_CDF), np.array(power_mat)
+
+
+def cal_rate_NP_CDF(channel, tx_power_in, tx_max, noise, DUE_thr, CUE_thr):
+    num_sample = channel.shape[0]
+    num_channel = channel.shape[1]
+
+    ## Note that the num_user i
+    num_D2D_user = channel.shape[2] - 1
+    tx_power = np.hstack((tx_power_in, tx_max * np.ones((tx_power_in.shape[0], 1, num_channel))))
+    power_mat = []
+    rate_D2D_CDF = []
+    rate_CUE_CDF = []
+
+    for i in range(num_sample):
+        cur_cap = 0
+        for j in range(num_channel):
+            cur_ch = channel[i][j]
+            cur_power = tx_power[i, :, j]
+            cur_power = np.array([cur_power])
+            cur_ch_cap = cal_SINR_one_sample_one_channel(cur_ch, cur_power, noise)
+            cur_cap = cur_cap + cur_ch_cap[0]
+            CUE_mask = CUE_mask * (cur_ch_cap[0, num_D2D_user] > CUE_thr)
+
+
+        D2D_sum = np.sum(cur_cap[:-1]) * CUE_mask
+        CUE_sum = np.sum(cur_cap[-1])
+
+        rate_D2D_CDF.append(D2D_sum / num_D2D_user)
+        rate_CUE_CDF.append(CUE_sum / num_channel)
+
+    return np.array(rate_D2D_CDF), np.array(rate_CUE_CDF)
+
+
+
+def random_power_CDF(channel, tx_max, granuty, noise, DUE_thr, CUE_thr):
+    num_sample = channel.shape[0]
+    num_channel = channel.shape[1]
+    ## Note that the num_user i
+    num_D2D_user = channel.shape[2] - 1
+    power_mat = []
+    rate_D2D_CDF = []
+    rate_CUE_CDF = []
+
+    tx_power = all_possible_tx_power(num_channel, num_D2D_user, granuty)
+    tx_power = tx_max * np.hstack((tx_power, np.ones((tx_power.shape[0], 1, num_channel))))
+
+    for i in range(num_sample):
+        cur_cap = 0
+        tx_power_select = tx_power[np.random.permutation(tx_power.shape[0])[0]]
+
+        for j in range(num_channel):
+            cur_ch = channel[i][j]
+            cur_ch_cap = cal_SINR_one_sample_one_channel(cur_ch, tx_power_select[:, j], noise)
+            cur_cap = cur_cap + cur_ch_cap
+            CUE_mask = CUE_mask * (cur_ch_cap[0, num_D2D_user] > CUE_thr)
+
+        D2D_sum = np.sum(cur_cap[:-1])* CUE_mask
+        CUE_sum = np.sum(cur_cap[-1])
+        rate_D2D_CDF.append(D2D_sum / num_D2D_user)
+        rate_CUE_CDF.append(CUE_sum / num_channel)
+        power_mat.append(tx_power_select[:-1])
+
+    return np.array(rate_D2D_CDF), np.array(rate_CUE_CDF), np.array(power_mat)
+
+
+
+
+
+
+
+
+
+def Print_CDF(model_full, model_par_dist, log_data_test, data_test, Num_channel, Num_user, Num_power_level,
+                    tx_max, noise, DUE_thr, CUE_thr, tx_power_set):
+
+    CDF_granu = 50.0
+    ### Full DNN case
+    rate_D2D_CDF, rate_CUE_CDF, power_mat = optimal_power_CDF(data_test, tx_max, Num_power_level, noise, DUE_thr, CUE_thr, tx_power_set)
+    sorted_D2D = np.sort(rate_D2D_CDF)
+    sorted_CUE = np.sort(rate_CUE_CDF)
+    opt_granu = int(sorted_D2D.shape[0]/CDF_granu)
+    print("***Optimal CDF***")
+    print("D2D")
+    print(sorted_D2D[::opt_granu])
+    print("")
+    print("CUE")
+    print(sorted_CUE[::opt_granu])
+    print("")
+    print("")
+
+    print("***Full DNN***")
+    DNN_tx_power_full = Print_DNN_OUT_CDF(model_full, log_data_test, data_test, Num_channel, Num_user, Num_power_level, tx_max, noise, DUE_thr, CUE_thr)
+    print("")
+
+    print("***Dist DNN***")
+    DNN_tx_power_dist = Print_DNN_OUT_CDF(model_par_dist, log_data_test, data_test, Num_channel, Num_user, Num_power_level, tx_max, noise, DUE_thr, CUE_thr)
+    print("")
+
+    print("***Naive DNN***")
+    DNN_tx_power_naive = Print_NAIVE_DNN_OUT_CDF(model_par_dist, log_data_test, data_test, Num_channel, Num_user, Num_power_level, tx_max, noise, DUE_thr, CUE_thr)
+    print("")
+
+    rate_D2D_CDF, rate_CUE_CDF, power_mat = random_power_CDF(data_test, tx_max, Num_power_level, noise, DUE_thr, CUE_thr)
+    sorted_D2D = np.sort(rate_D2D_CDF)
+    sorted_CUE = np.sort(rate_CUE_CDF)
+    opt_granu = int(sorted_D2D.shape[0]/CDF_granu)
+    print("***Random CDF***")
+
+    print(opt_granu)
+    print(sorted_D2D.shape[0])
+    print("D2D")
+    print(sorted_D2D[::opt_granu])
+    print("")
+    print("CUE")
+    print(sorted_CUE[::opt_granu])
+    print("")
+    print("")
+
+    return 0
+
+
+
+def Print_DNN_OUT_CDF(model, log_data, real_data, Num_channel, Num_user, Num_power_level, tx_max, noise, DUE_thr, CUE_thr):
+    CDF_granu = 50.0
+    DNN_out_pre = model.predict(log_data)
+    DNN_out_pre = DNN_out_pre[:, :, :Num_channel + Num_power_level]
+    DNN_out = convert_TX_power(Num_channel, Num_user, Num_power_level, DNN_out_pre, tx_max)
+    DNN_Filter = transform_tx_power(DNN_out, Num_power_level, tx_max)
+
+    rate_D2D_CDF, rate_CUE_CDF = cal_rate_NP_CDF(real_data, DNN_Filter, tx_max, noise, DUE_thr, CUE_thr)
+    sorted_D2D = np.sort(rate_D2D_CDF)
+    sorted_CUE = np.sort(rate_CUE_CDF)
+    opt_granu = int(sorted_D2D.shape[0] / CDF_granu)
+    print("D2D")
+    print(sorted_D2D[::opt_granu])
+    print("")
+    print("CUE")
+    print(sorted_CUE[::opt_granu])
+    print("")
+    return DNN_Filter
+
+
+def Print_NAIVE_DNN_OUT_CDF(model, log_data, real_data, Num_channel, Num_user, Num_power_level, tx_max, noise, DUE_thr, CUE_thr):
+    CDF_granu = 50.0
+    for i in range(Num_user):
+        masking_mat = np.zeros(log_data.shape)
+        masking_mat[:, :, :, i] = 1
+        rev_data = masking_mat * log_data
+        DNN_out_pre_ind = model.predict(rev_data)
+        DNN_out_pre_ind = DNN_out_pre_ind[:, :, :Num_channel + Num_power_level]
+        output_temp = DNN_out_pre_ind[:, i, :].reshape(log_data.shape[0], 1, DNN_out_pre_ind.shape[-1])
+        if i == 0:
+            DNN_out_pre = output_temp
+        else:
+            DNN_out_pre = np.hstack((DNN_out_pre, output_temp))
+
+    DNN_out = convert_TX_power(Num_channel, Num_user, Num_power_level, DNN_out_pre, tx_max)
+    DNN_Filter = transform_tx_power(DNN_out, Num_power_level, tx_max)
+    rate_D2D_CDF, rate_CUE_CDF = cal_rate_NP_CDF(real_data, DNN_Filter, tx_max, noise, DUE_thr, CUE_thr)
+    sorted_D2D = np.sort(rate_D2D_CDF)
+    sorted_CUE = np.sort(rate_CUE_CDF)
+    opt_granu = int(sorted_D2D.shape[0] / CDF_granu)
+    print("D2D")
+    print(sorted_D2D[::opt_granu])
+    print("")
+    print("CUE")
+    print(sorted_CUE[::opt_granu])
+    print("")
+    return DNN_Filter
+
+
+
+
+####################################################################################
+####################################################################################
+####################################################################################
+####################################################################################
+
+
+Num_user = 3           ##################3
+Num_channel = 3        #################
+Num_power_level = 8
+Num_enc_BS = 150
+Num_enc_user = 150
+Num_PC_val = 150
+Num_RA_val = 150
+Num_cqi = 12
+Num_PC_sig = Num_user*8
+Num_layers_full = 16
+Num_weights_full = 400
+
+
+BW = 1e7
+noise = BW*10**-17.4
+num_samples_init = int(1e6)  ##########
+num_samples = int(1e6)
+num_samples_test = int(1e5)
+num_init = 50000
+Size_area = 100    ############################################################
+D2D_dist = 30      ######## change 2
+batch_size_set = 1024
+
+
+DUE_thr = -0.5
+tx_max = 10**2.3
+channel_error = 0.0
+
+epoch_num_init = 7
+epoch_num = 100
+
+
+CAP_1_MAT_TOT = []
+CAP_2_MAT_TOT = []
+CAP_CUE_MAT_TOT = []
+VIO_PRO_MAT_TOT = []
+VIO_CAP_MAT_TOT = []
+
+
+
+for outer_loop in range(1):
+    CUE_thr = 0.6931 * 0.5 * (2-outer_loop)
+    CUE_thr = 0.6931 * 1.0
+
+    data_train_full = np.array(ch_gen(Size_area, D2D_dist, Num_user, Num_channel, num_samples_init), dtype=np.float32)
+    data_train, data_train_infeasible = optimal_power_check_valid(data_train_full, tx_max, Num_power_level, noise, DUE_thr, CUE_thr)
+
+    print("Number of feasible sets:  ", data_train.shape)
+    print("Number of INfeasible sets:  ", data_train_infeasible.shape)
+    print("")
+
+    data_train = data_train[:batch_size_set * (data_train.shape[0] // batch_size_set)]
+
+    ## Recalculate the number of feasible solutions
+    num_samples = data_train.shape[0]
+    labels = np.zeros(num_samples, )
+    log_data = np.log(data_train)
+    log_data_mean = np.mean(log_data)
+    log_data_std = np.std(log_data)
+    log_data = (log_data - log_data_mean) / log_data_std
+
+
+    # print(log_data.shape)
+    # aa = np.random.randn(10000, 2, 3, 3)
+    # print(aa)
+    # print("")
+
+    ####################################################################
+    ## Generate the test channel set
+    ## Only the valid channel is used for test
+    data_test_full = np.array(ch_gen(Size_area, D2D_dist, Num_user, Num_channel, num_samples_test), dtype=np.float32)
+    data_test, data_test_infeasible = optimal_power_check_valid(data_test_full, tx_max, Num_power_level, noise, DUE_thr,
+                                                                CUE_thr)
+    log_data_test = np.log(data_test)
+    log_data_test_infeasible = np.log(data_test_infeasible)
+    log_data_test = (log_data_test - log_data_mean) / log_data_std
+    log_data_test_infeasible = (log_data_test_infeasible - log_data_mean) / log_data_std
+    data_test = data_test + channel_error * np.multiply(data_test,
+                                                        np.random.randn(data_test.shape[0], Num_channel, Num_user + 1,
+                                                                        Num_user + 1))
+    ####################################################################
+
+
+
+    tx_power_set = all_possible_tx_power(Num_channel, Num_user, Num_power_level - 1)
+    print("Preprecess of data is finished")
+    time_cur = time.time()
+    OPT_DUE_train, OPT_CUE_train, opt_power = optimal_power(data_train[:num_init], tx_max, Num_power_level, noise, DUE_thr, CUE_thr, tx_power_set)
+
+    #OPT_DUE_train = DUE_OPT_VAL[outer_loop]
+    #OPT_CUE_train = CUE_OPT_VAL[outer_loop]
+
+    print("cur_time 1 : ", time.time() - time_cur)
+    time_cur = time.time()
+    opt_power_label = convert_optimal_power(opt_power, tx_max, Num_power_level, Num_channel)
+    print("cur_time 2: ", time.time() - time_cur)
+
+    ## Initialization steps
+
+    ########################
+    ### Full model creation
+    #######################
+    time_cur = time.time()
+
+    model_full = DNN_model_full(Num_channel, Num_user, Num_power_level, Num_weights_full, Num_layers_full)
+    model_full.compile(optimizer=tf.train.AdamOptimizer(0.001),
+                       loss=Init_loss_wrapper(model_full.input),
+                       metrics=[Init_loss_wrapper(model_full.input)])
+    model_full.fit(log_data[:num_init], opt_power_label, batch_size=128, epochs=epoch_num_init, verbose=2)
+
+    print("cur_time 3: ", time.time() - time_cur)
+
+    ###############################
+    ### Partially distributed model
+    ###############################
+    time_cur = time.time()
+
+    model_par_dist = DNN_model_dist(Num_channel, Num_user, Num_enc_user, Num_cqi, Num_enc_BS, Num_PC_sig, Num_PC_val,
+                                    Num_power_level, Num_RA_val)
+    model_par_dist.compile(optimizer=tf.train.AdamOptimizer(0.001),
+                           loss=Init_loss_wrapper(model_par_dist.input),
+                           metrics=[Init_loss_wrapper(model_par_dist.input)])
+    model_par_dist.fit(log_data[:num_init], opt_power_label, batch_size=128, epochs=epoch_num_init, verbose=2)
+    print("cur_time 4: ", time.time() - time_cur)
+
+
+    print("")
+    print("Initialization is finished")
+    print("")
+    print("Init train results (Train) --- %0.2f" % (CUE_thr / 0.6931))
+    Print_Test_Full(model_full, model_par_dist, log_data[:num_init], data_train[:num_init],
+                    Num_channel,
+                    Num_user,
+                    Num_power_level, tx_max, noise, DUE_thr, CUE_thr, OPT_DUE_train, OPT_CUE_train, tx_power_set)
+
+    print("")
+    print("*" * 50)
+    print("")
+
+    #############################################################################################
+
+    print("Test results")
+    OPT_DUE_test, OPT_CUE_test, opt_power = optimal_power(data_test, tx_max, Num_power_level, noise, DUE_thr, CUE_thr, tx_power_set)
+
+    #OPT_DUE_train = 7.63*0.6931
+    #OPT_CUE_train = 2.83*0.6931
+    #OPT_DUE_test = 7.63*0.6931
+    #OPT_CUE_test = 2.83*0.6931
+
+    OPT_DUE_train = OPT_DUE_test
+    OPT_CUE_train = OPT_CUE_test
+
+    Print_Test_Full(model_full, model_par_dist, log_data_test, data_test,
+                    Num_channel, Num_user,
+                    Num_power_level, tx_max, noise, DUE_thr, CUE_thr, OPT_DUE_test, OPT_CUE_test, tx_power_set)
+
+    print("")
+    print("*" * 50)
+    print("")
+    print("")
+
+    '''
+
+    Print_CDF(model_full, model_par_dist, log_data_test, data_test, Num_channel, Num_user, Num_power_level,
+              tx_max, noise, DUE_thr, CUE_thr, tx_power_set)
+
+    '''
+
+    '''
+    '''
+
+
+    print("")
+    print("Outer_loop: %d "%outer_loop)
+    print("CUE thr: %0.2f " %(CUE_thr/0.6931))
+
+    learning_rate_cur = 0.001*1e-3
+    lambda_mat = np.ones((4, 1))
+    coeff_factor = 1.0
+    lambda_mat[0] = 1.0 *coeff_factor
+    lambda_mat[1] = 70.0 * coeff_factor
+    lambda_mat[2] = 15.0 * coeff_factor
+    lambda_mat[3] = 0.0
+
+
+    print("lambda")
+    print(lambda_mat)
+    print("")
+
+    lambda_mat_2 = np.ones((4, 1))
+    lambda_mat_2[0] = 0.5 * 0.1
+    lambda_mat_2[1] = 350.0 * 0.1
+    lambda_mat_2[2] = 10.0 * 0.1
+    lambda_mat_2[3] = 2.0 * 0.1
+
+    print("lambda_2")
+    print(lambda_mat_2)
+    print("")
+
+
+    cap_full = []
+    cap_dist = []
+    prob_full = []
+    prob_dist = []
+
+
+    for i in range(12):
+
+        if i%500 == 0:
+            learning_rate_cur = learning_rate_cur
+
+
+            print("")
+            print("learning_rate : ", learning_rate_cur)
+            print("lambda : ", lambda_mat)
+
+            ######################################################################################################
+            #model_full.save_weights('./weights/my_model_full')
+            model_full = DNN_model_full(Num_channel, Num_user, Num_power_level, Num_weights_full, Num_layers_full)
+            model_full.compile(optimizer=tf.train.AdamOptimizer(learning_rate_cur),
+                               loss=Total_loss_wrapper(model_full.input, noise, DUE_thr, CUE_thr, tx_max,
+                                                       batch_size_set,
+                                                       log_data_mean, log_data_std, lambda_mat),
+                               metrics=[
+                                   Rate_loss_wrapper(model_full.input, noise, DUE_thr, CUE_thr, tx_max, batch_size_set,
+                                                     log_data_mean, log_data_std, lambda_mat),
+                                   Rate_loss_2_wrapper(model_full.input, noise, DUE_thr, CUE_thr, tx_max,
+                                                       batch_size_set,
+                                                       log_data_mean, log_data_std, lambda_mat),
+                                   CUE_CONST_loss_wrapper(model_full.input, noise, DUE_thr, CUE_thr, tx_max,
+                                                          batch_size_set,
+                                                          log_data_mean, log_data_std, lambda_mat),
+                                   INT_CONST_loss_wrapper(model_full.input)
+                                   ])
+
+            model_full.load_weights('./weights/my_model_full')
+
+
+            ######################################################################################################
+            ######################################################################################################
+            ######################################################################################################
+            #model_par_dist.save_weights('./weights/my_model_par_dist')
+            model_par_dist = DNN_model_dist(Num_channel, Num_user, Num_enc_user, Num_cqi, Num_enc_BS, Num_PC_sig,
+                                            Num_PC_val, Num_power_level, Num_RA_val)
+            model_par_dist.compile(optimizer=tf.train.AdamOptimizer(learning_rate_cur),
+                                   loss=Total_loss_wrapper(model_par_dist.input, noise, DUE_thr, CUE_thr, tx_max,
+                                                           batch_size_set,
+                                                           log_data_mean, log_data_std, lambda_mat_2),
+                                   metrics=[
+                                       Rate_loss_wrapper(model_par_dist.input, noise, DUE_thr, CUE_thr, tx_max,
+                                                         batch_size_set,
+                                                         log_data_mean, log_data_std, lambda_mat_2),
+                                       Rate_loss_2_wrapper(model_par_dist.input, noise, DUE_thr, CUE_thr, tx_max,
+                                                         batch_size_set,
+                                                         log_data_mean, log_data_std, lambda_mat_2),
+                                       CUE_CONST_loss_wrapper(model_par_dist.input, noise, DUE_thr, CUE_thr, tx_max,
+                                                              batch_size_set,
+                                                              log_data_mean, log_data_std, lambda_mat_2),
+                                       INT_CONST_loss_wrapper(model_par_dist.input)
+                                   ])
+
+            model_par_dist.load_weights('./weights/my_model_par_dist')
+
+
+
+            print("model loading finished")
+            print("")
+
+        ######################################################################################################
+        ######################################################################################################
+
+
+
+        model_full.fit(log_data, labels, batch_size=batch_size_set, epochs=epoch_num, verbose=2)
+        print("")
+        print("full model training is finished")
+        print("")
+        model_par_dist.fit(log_data, labels, batch_size=batch_size_set, epochs=epoch_num, verbose=2)
+        print("")
+        print("dist model training is finished")
+        print("")
+
+
+        data_train_full = np.array(ch_gen(Size_area, D2D_dist, Num_user, Num_channel, num_samples_init),
+                                   dtype=np.float32)
+        data_train, data_train_infeasible = optimal_power_check_valid(data_train_full, tx_max, Num_power_level,
+                                                                      noise,
+                                                                      DUE_thr, CUE_thr)
+
+        data_train = data_train[:batch_size_set * (data_train.shape[0] // batch_size_set)]
+
+        ## Recalculate the number of feasible solutions
+        num_samples = data_train.shape[0]
+        labels = np.zeros(num_samples, )
+        log_data = np.log(data_train)
+        log_data = (log_data - log_data_mean) / log_data_std
+
+        print("%d-th iteration is finished  " % i)
+        print("CUE-Thr   ---   %0.2f" % (CUE_thr / 0.6931))
+        print("")
+
+
+        CAP_1_MAT, CAP_2_MAT, CAP_CUE_MAT, VIO_PRO_MAT, VIO_CAP_MAT = Print_Test_Full(model_full, model_par_dist, log_data_test, data_test,
+                        Num_channel, Num_user,
+                        Num_power_level, tx_max, noise, DUE_thr, CUE_thr, OPT_DUE_test, OPT_CUE_test, tx_power_set)
+
+
+        cap_full.append(CAP_1_MAT[1])
+        cap_dist.append(CAP_1_MAT[2])
+        prob_full.append(VIO_PRO_MAT[0])
+        prob_dist.append(VIO_PRO_MAT[1])
+
+        print("")
+        print("Cap ():")
+        print(np.array(cap_full))
+        print(np.array(cap_dist))
+        print("Prob ():")
+        print(np.array(prob_full))
+        print(np.array(prob_dist))
+
+        DNN_out_pre_val = model_par_dist.predict(log_data_test)[:, :, Num_channel + Num_power_level:]
+        DNN_out_pre_val = DNN_out_pre_val.reshape([-1, Num_cqi * Num_user + Num_PC_sig])
+        print("")
+        print("Feeback of first node")
+        print("Raw data")
+        print(DNN_out_pre_val[:10, :Num_cqi])
+        print("normalized")
+        print(np.round(DNN_out_pre_val[:10, :Num_cqi]))
+        print(np.sum(np.round(DNN_out_pre_val[:, :Num_cqi]), axis=0))
+
+        print("")
+        print("#" * 50)
+        print("#" * 50)
+        print("#" * 50)
+        print("")
+        print("")
+
+
+
+
+    CAP_1_MAT, CAP_2_MAT, CAP_CUE_MAT, VIO_PRO_MAT, VIO_CAP_MAT = Print_Test_Full(model_full, model_par_dist,
+                                                                                  log_data_test, data_test,
+                                                                                  Num_channel, Num_user,
+                                                                                  Num_power_level, tx_max, noise,
+                                                                                  DUE_thr, CUE_thr, OPT_DUE_test, OPT_CUE_test, tx_power_set)
+
+
+    Print_CDF(model_full, model_par_dist, log_data_test, data_test, Num_channel, Num_user, Num_power_level,
+              tx_max, noise, DUE_thr, CUE_thr, tx_power_set)
+
+
+
+
+    DNN_out_pre_val = model_full.predict(log_data_test)[:50000, :, :Num_channel + Num_power_level]
+    DNN_out_pre_val = DNN_out_pre_val.reshape([-1, Num_channel + Num_power_level])
+    print("")
+
+    print("Power level CDF (Cent)")
+    sorted_FN = np.sort(np.ravel(np.abs(np.round(DNN_out_pre_val[:, :Num_power_level]) - DNN_out_pre_val[:, :Num_power_level])))
+    opt_granu = int(sorted_FN.shape[0] / 50)
+    print(sorted_FN[::opt_granu])
+    print("")
+
+    print("Channel CDF (Cent)")
+    sorted_FN = np.sort(np.ravel(np.abs(np.round(DNN_out_pre_val[:, Num_power_level:]) - DNN_out_pre_val[:, Num_power_level:])))
+    opt_granu = int(sorted_FN.shape[0] / 50)
+    print(sorted_FN[::opt_granu])
+    print("")
+
+
+    DNN_out_pre_val = model_par_dist.predict(log_data_test)[:50000, :, :Num_channel + Num_power_level]
+    DNN_out_pre_val = DNN_out_pre_val.reshape([-1, Num_channel + Num_power_level])
+    print("")
+
+    print("Power level CDF (Dist)")
+    sorted_FN = np.sort(np.ravel(np.abs(np.round(DNN_out_pre_val[:, :Num_power_level]) - DNN_out_pre_val[:, :Num_power_level])))
+    opt_granu = int(sorted_FN.shape[0] / 50)
+    print(sorted_FN[::opt_granu])
+    print("")
+
+    print("Channel CDF (Dist)")
+    sorted_FN = np.sort(np.ravel(np.abs(np.round(DNN_out_pre_val[:, Num_power_level:]) - DNN_out_pre_val[:, Num_power_level:])))
+    opt_granu = int(sorted_FN.shape[0] / 50)
+    print(sorted_FN[::opt_granu])
+    print("")
+
+
+
+    DNN_out_pre_val = model_par_dist.predict(log_data_test)[:50000, :, Num_channel + Num_power_level:]
+    DNN_out_pre_val = DNN_out_pre_val.reshape([-1, Num_cqi * Num_user + Num_PC_sig])
+    print("")
+
+    print("Fist node CDF")
+    sorted_FN = np.sort(np.ravel(np.abs(np.round(DNN_out_pre_val[:, :Num_cqi]) - DNN_out_pre_val[:, :Num_cqi])))
+    opt_granu = int(sorted_FN.shape[0] / 50)
+    print(sorted_FN[::opt_granu])
+    print("")
+    print("Second node CDF")
+    sorted_SN = np.sort(np.ravel(np.abs(np.round(DNN_out_pre_val[:, Num_cqi:2 * Num_cqi]) - DNN_out_pre_val[:, Num_cqi:2 * Num_cqi])))
+    opt_granu = int(sorted_SN.shape[0] / 50)
+    print(sorted_SN[::opt_granu])
+    print("")
+    print("")
+    print("Third node CDF")
+    sorted_FN = np.sort(np.ravel(np.abs(np.round(DNN_out_pre_val[:, 2*Num_cqi:3 * Num_cqi]) - DNN_out_pre_val[:, 2*Num_cqi:3 * Num_cqi])))
+    opt_granu = int(sorted_FN.shape[0] / 50)
+    print(sorted_FN[::opt_granu])
+    print("")
+    print("")
+    print("Feeback of BS signal")
+    print("BS CDF")
+    sorted_BS = np.sort(np.ravel(np.abs(np.round(DNN_out_pre_val[:, 3 * Num_cqi:]) - DNN_out_pre_val[:, 3 * Num_cqi:])))
+    opt_granu = int(sorted_BS.shape[0] / 50)
+    print(sorted_BS[::opt_granu])
+    print("")
+    print("")
+
+
+
+
+    CAP_1_MAT_TOT.append(CAP_1_MAT)
+    CAP_2_MAT_TOT.append(CAP_2_MAT)
+    CAP_CUE_MAT_TOT.append(CAP_CUE_MAT)
+    VIO_PRO_MAT_TOT.append(VIO_PRO_MAT)
+    VIO_CAP_MAT_TOT.append(VIO_CAP_MAT)
+
+
+
+
+print("")
+print("")
+print("")
+print("CAP_1: ")
+print(np.array(CAP_1_MAT_TOT))
+print("")
+print("CAP_2: ")
+print(np.array(CAP_2_MAT_TOT))
+print("")
+print("CAP_CUE: ")
+print(np.array(CAP_CUE_MAT_TOT))
+print("")
+print("Violation proba.: ")
+print(np.array(VIO_PRO_MAT_TOT))
+print("")
+print("Violation capacity: ")
+print(np.array(VIO_CAP_MAT_TOT))
+print("")
